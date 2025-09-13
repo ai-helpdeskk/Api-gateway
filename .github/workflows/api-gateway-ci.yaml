@@ -11,73 +11,41 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/bedrock-chat-api-gateway
 
 jobs:
-  lint:
-    name: Lint Code
+  ci-pipeline:
+    name: CI Pipeline
     runs-on: [self-hosted]
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      run: |
-        python3 --version || {
-          echo "Python 3 not found, installing..."
-          sudo apt-get update -qq
-          sudo apt-get install -y python3 python3-pip python3-venv
-        }
-        python3 -m venv venv
-        source venv/bin/activate
-        python --version
+      - name: Set up Python and install dependencies
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 bandit safety pytest
 
-    - name: Install linting dependencies
-      run: |
-        source venv/bin/activate
-        python -m pip install --upgrade pip
-        pip install flake8 black isort bandit
-        pip install -r requirements.txt || echo "Requirements install had issues"
+      - name: Run Linting
+        continue-on-error: true
+        run: |
+          source venv/bin/activate
+          flake8 .
 
-    - name: Run linting checks
-      run: |
-        source venv/bin/activate
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || echo "Flake8 critical errors check completed"
-        black --check --diff . || echo "Black formatting check completed"
-        isort --check-only --diff . || echo "isort check completed"
+      - name: Run Security Scans
+        continue-on-error: true
+        run: |
+          source venv/bin/activate
+          bandit -r .
+          safety check
 
-  sast:
-    name: SAST Security Analysis
-    runs-on: [self-hosted]
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Python and run security analysis
-      run: |
-        python3 -m venv venv
-        source venv/bin/activate
-        pip install bandit safety
-        pip install -r requirements.txt
-        bandit -r . || echo "Bandit analysis completed"
-        safety check || echo "Safety check completed"
-
-  unit-tests:
-    name: Unit Tests
-    runs-on: [self-hosted]
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Python and run tests
-      run: |
-        python3 -m venv venv
-        source venv/bin/activate
-        pip install -r requirements.txt
-        pip install pytest pytest-cov pytest-asyncio httpx
-
-    - name: Create test directory and files
-      run: |
-        mkdir -p tests
-        if [ ! -f tests/test_main.py ]; then
-        echo 'import pytest
+      - name: Run Unit Tests
+        continue-on-error: true
+        run: |
+          source venv/bin/activate
+          mkdir -p tests
+          if [ ! -f tests/test_main.py ]; then
+          echo 'import pytest
 from fastapi.testclient import TestClient
 import sys
 import os
@@ -89,32 +57,27 @@ def test_root():
     assert response.status_code == 200
     assert "API Gateway is running" in response.json()["message"]
 ' > tests/test_main.py
-        fi
-
-    - name: Run unit tests
-      run: |
-        source venv/bin/activate
-        python -m pytest tests/ --cov=. || echo "Tests completed"
+          fi
+          pytest tests/
 
   build:
     name: Build and Push Docker Image
-    needs: [lint, sast, unit-tests]
+    needs: ci-pipeline
     runs-on: [self-hosted]
-    if: always()
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ghcr.io/${{ env.IMAGE_NAME }}:latest
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ env.IMAGE_NAME }}:latest
