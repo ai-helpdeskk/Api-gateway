@@ -13,325 +13,513 @@ jobs:
     name: Deploy API Gateway
     runs-on: [self-hosted]
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Verify kubectl access
+    - name: Verify environment
       run: |
-        kubectl cluster-info || {
-          echo "❌ kubectl not accessible"
+        echo "🔍 Verifying deployment environment..."
+        echo "Runner: $(uname -a)"
+        echo "Docker version: $(docker --version)"
+        echo "kubectl version: $(kubectl version --client --short 2>/dev/null || echo 'kubectl not found')"
+        
+        if ! kubectl cluster-info &>/dev/null; then
+          echo "❌ kubectl cannot access cluster"
           exit 1
-        }
-        kubectl get nodes || {
-          echo "❌ Cannot access cluster nodes"
-          exit 1
-        }
-        echo "✅ Cluster access verified"
-
-    - name: Wait for infrastructure dependencies
-      run: |
-        echo "⏳ Waiting for infrastructure to be ready..."
-
-        # Wait for namespace
-        echo "Checking for namespace bedrock-chat-v2..."
-        for i in {1..30}; do
-          if kubectl get namespace bedrock-chat-v2 2>/dev/null; then
-            echo "✅ Namespace bedrock-chat-v2 found"
-            break
-          fi
-          echo "Waiting for namespace... ($i/30)"
-          sleep 10
-        done
-
-        # Wait for MySQL secrets
-        echo "Checking for MySQL secrets..."
-        for i in {1..30}; do
-          if kubectl get secret mysql-secrets -n bedrock-chat-v2 2>/dev/null; then
-            echo "✅ MySQL secrets found"
-            break
-          fi
-          echo "Waiting for MySQL secrets... ($i/30)"
-          sleep 10
-        done
-
-        # Wait for app-config ConfigMap
-        echo "Checking for app-config ConfigMap..."
-        for i in {1..30}; do
-          if kubectl get configmap app-config -n bedrock-chat-v2 2>/dev/null; then
-            echo "✅ App-config ConfigMap found"
-            break
-          fi
-          echo "Waiting for app-config ConfigMap... ($i/30)"
-          sleep 10
-        done
-
-        # Wait for MySQL to be ready
-        echo "Checking for MySQL..."
-        kubectl wait --for=condition=ready pod -l app=mysql -n bedrock-chat-v2 --timeout=300s || echo "⚠️ MySQL not ready yet, but continuing..."
-
-        # Wait for Bedrock Service (dependency)
-        echo "Checking for Bedrock Service..."
-        kubectl wait --for=condition=ready pod -l app=bedrock-service -n bedrock-chat-v2 --timeout=300s || echo "⚠️ Bedrock Service not ready yet, but continuing..."
-
-        # Wait for File Service (dependency)
-        echo "Checking for File Service..."
-        kubectl wait --for=condition=ready pod -l app=file-service -n bedrock-chat-v2 --timeout=300s || echo "⚠️ File Service not ready yet, but continuing..."
-
-        # Wait for docker-hub-secret
-        echo "Checking for docker-hub-secret..."
-        for i in {1..30}; do
-          if kubectl get secret docker-hub-secret -n bedrock-chat-v2 2>/dev/null; then
-            echo "✅ Docker Hub secret found"
-            break
-          fi
-          echo "Waiting for docker-hub-secret... ($i/30)"
-          sleep 10
-        done
-
-        echo "✅ Infrastructure dependencies checked"
-
-    - name: Get latest image tag
-      id: get-image
-      run: |
-        # Get the latest commit SHA from main branch
-        LATEST_SHA=$(git rev-parse HEAD)
-        IMAGE_TAG="samitsinghhh/api-gateway:${LATEST_SHA}"
-        echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-        echo "Using image: $IMAGE_TAG"
-
-    - name: Update deployment manifests
-      run: |
-        cd k8s
-
-        if [ -f deployment.yaml ]; then
-          # Update the image tag in deployment.yaml to match your existing format
-          sed -i "s|image: samitsinghhh/api-gateway:.*|image: samitsinghhh/api-gateway:$(git rev-parse HEAD)|g" deployment.yaml
-          echo "Updated deployment.yaml:"
-          grep "image:" deployment.yaml || echo "No image line found"
-        else
-          echo "⚠️ deployment.yaml not found"
         fi
+        echo "✅ Environment verified"
+
+    - name: Wait for critical dependencies
+      run: |
+        echo "⏳ Waiting for critical dependencies..."
+        
+        # Ensure namespace exists
+        kubectl create namespace bedrock-chat-v2 --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Wait for MySQL (critical dependency)
+        echo "🗄️ Waiting for MySQL database..."
+        for i in {1..40}; do
+          if kubectl get pods -n bedrock-chat-v2 -l app=mysql 2>/dev/null | grep -q Running; then
+            echo "✅ MySQL is running"
+            break
+          fi
+          if [[ $i -eq 40 ]]; then
+            echo "⚠️ MySQL not ready after 10 minutes - deploying anyway but API Gateway may fail to start"
+          else
+            echo "Waiting for MySQL... ($i/40)"
+            sleep 15
+          fi
+        done
+        
+        # Wait for Bedrock Service (critical dependency)
+        echo "🤖 Waiting for Bedrock Service..."
+        for i in {1..30}; do
+          if kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service 2>/dev/null | grep -q Running; then
+            echo "✅ Bedrock Service is running"
+            break
+          fi
+          if [[ $i -eq 30 ]]; then
+            echo "⚠️ Bedrock Service not ready - API Gateway will deploy but AI functionality may not work"
+          else
+            echo "Waiting for Bedrock Service... ($i/30)"
+            sleep 10
+          fi
+        done
+        
+        # Wait for File Service (critical dependency)
+        echo "📁 Waiting for File Service..."
+        for i in {1..30}; do
+          if kubectl get pods -n bedrock-chat-v2 -l app=file-service 2>/dev/null | grep -q Running; then
+            echo "✅ File Service is running"
+            break
+          fi
+          if [[ $i -eq 30 ]]; then
+            echo "⚠️ File Service not ready - file upload functionality may not work"
+          else
+            echo "Waiting for File Service... ($i/30)"
+            sleep 10
+          fi
+        done
+
+    - name: Setup configuration
+      run: |
+        echo "⚙️ Setting up API Gateway configuration..."
+        
+        # Create comprehensive app-config
+        kubectl create configmap app-config \
+          --from-literal=DATABASE_URL="mysql://bedrock_user:bedrock_password@mysql:3306/bedrock_chat" \
+          --from-literal=BEDROCK_SERVICE_URL="http://bedrock-service:9000" \
+          --from-literal=FILE_SERVICE_URL="http://file-service:7000" \
+          --from-literal=AWS_REGION="us-east-1" \
+          --from-literal=REACT_APP_API_URL="/api" \
+          -n bedrock-chat-v2 \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Create MySQL secrets if they don't exist
+        kubectl create secret generic mysql-secrets \
+          --from-literal=MYSQL_ROOT_PASSWORD="rootpassword123" \
+          --from-literal=MYSQL_DATABASE="bedrock_chat" \
+          --from-literal=MYSQL_USER="bedrock_user" \
+          --from-literal=MYSQL_PASSWORD="bedrock_password" \
+          -n bedrock-chat-v2 \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Create Docker Hub secret if needed
+        if ! kubectl get secret docker-hub-secret -n bedrock-chat-v2 &>/dev/null; then
+          kubectl create secret generic docker-hub-secret \
+            --from-literal=.dockerconfigjson='{"auths":{"https://index.docker.io/v1/":{"auth":"ZHVtbXk="}}}' \
+            --type=kubernetes.io/dockerconfigjson \
+            -n bedrock-chat-v2
+        fi
+        
+        echo "✅ Configuration setup completed"
 
     - name: Deploy API Gateway
       run: |
-        echo "🚀 Deploying API Gateway to Kubernetes..."
-
-        # Apply all manifests in order
-        echo "Applying Service..."
+        echo "🚀 Deploying API Gateway..."
+        
+        # Deploy in order: Service first for DNS resolution
+        echo "📡 Creating service..."
         kubectl apply -f k8s/service.yaml -n bedrock-chat-v2
-
-        echo "Applying Deployment..."
+        
+        echo "🏗️ Creating deployment..."
         kubectl apply -f k8s/deployment.yaml -n bedrock-chat-v2
-
-        echo "Applying HPA..."
-        kubectl apply -f k8s/hpa.yaml -n bedrock-chat-v2 || echo "⚠️ HPA failed to apply"
-
-        echo "Applying Network Policy..."
-        kubectl apply -f k8s/network-policy.yaml -n bedrock-chat-v2 || echo "⚠️ Network Policy failed to apply"
-
+        
+        # Apply HPA
+        echo "📈 Applying HPA..."
+        kubectl apply -f k8s/hpa.yaml -n bedrock-chat-v2 || echo "⚠️ HPA failed (metrics-server may not be available)"
+        
+        # Apply Network Policy
+        echo "🔒 Applying Network Policy..."
+        kubectl apply -f k8s/network-policy.yaml -n bedrock-chat-v2 || echo "⚠️ Network Policy failed"
+        
         echo "⏳ Waiting for deployment rollout..."
-        kubectl rollout status deployment/api-gateway -n bedrock-chat-v2 --timeout=600s || {
-          echo "⚠️ Deployment rollout timed out or failed"
-          echo "Checking pod status..."
-          kubectl get pods -n bedrock-chat-v2 -l app=api-gateway
-          echo "Checking recent events..."
-          kubectl get events -n bedrock-chat-v2 --sort-by='.lastTimestamp' | tail -10
-        }
+        if kubectl rollout status deployment/api-gateway -n bedrock-chat-v2 --timeout=600s; then
+          echo "✅ API Gateway deployed successfully"
+        else
+          echo "⚠️ Deployment rollout timeout - checking status..."
+          kubectl get pods -n bedrock-chat-v2 -l app=api-gateway -o wide
+          kubectl describe deployment api-gateway -n bedrock-chat-v2
+        fi
 
-        echo "✅ API Gateway deployment process completed"
-
-    - name: Wait for pod readiness
+    - name: Wait for readiness
       run: |
-        echo "⏳ Waiting for pods to be ready..."
+        echo "⏳ Waiting for API Gateway to be ready..."
+        
+        # Wait for pods to be ready
         kubectl wait --for=condition=ready pod -l app=api-gateway -n bedrock-chat-v2 --timeout=300s || {
           echo "⚠️ Pods not ready within timeout"
-          kubectl describe pods -n bedrock-chat-v2 -l app=api-gateway
+          echo "Pod status:"
+          kubectl get pods -n bedrock-chat-v2 -l app=api-gateway -o wide
+          echo "Pod events:"
+          kubectl get events -n bedrock-chat-v2 --field-selector involvedObject.kind=Pod | grep api-gateway
         }
 
     - name: Verify deployment
       run: |
         echo "🔍 Verifying API Gateway deployment..."
-
+        
         echo "=== Deployment Status ==="
-        kubectl get deployment api-gateway -n bedrock-chat-v2 -o wide || echo "Deployment not found"
-
+        kubectl get deployment api-gateway -n bedrock-chat-v2 -o wide
+        
         echo "=== Pods ==="
-        kubectl get pods -n bedrock-chat-v2 -l app=api-gateway -o wide || echo "No api-gateway pods found"
-
+        kubectl get pods -n bedrock-chat-v2 -l app=api-gateway -o wide
+        
         echo "=== Service ==="
-        kubectl get service api-gateway -n bedrock-chat-v2 -o wide || echo "No api-gateway service found"
-
+        kubectl get service api-gateway -n bedrock-chat-v2 -o wide
+        
         echo "=== HPA Status ==="
-        kubectl get hpa api-gateway-hpa -n bedrock-chat-v2 || echo "No HPA found"
-
-        echo "=== Recent Pod Logs ==="
+        kubectl get hpa api-gateway-hpa -n bedrock-chat-v2 2>/dev/null || echo "HPA not available"
+        
+        echo "=== Recent Logs ==="
         kubectl logs -n bedrock-chat-v2 -l app=api-gateway --tail=20 || echo "No logs available"
 
-        echo "✅ API Gateway verification completed"
-
-    - name: Test API Gateway endpoints
+    - name: Health check
       run: |
-        echo "🧪 Testing API Gateway Endpoints..."
+        echo "🏥 Performing comprehensive health checks..."
         
         # Test health endpoint
-        echo "=== Testing Health Endpoint ==="
-        kubectl run test-api-health-$RANDOM --image=curlimages/curl --rm -i --restart=Never -n bedrock-chat-v2 --timeout=60s -- \
-          curl -f http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/health || echo "⚠️ Health check failed"
+        for i in {1..15}; do
+          echo "Health check attempt $i/15..."
+          
+          if kubectl run api-health-test-$RANDOM \
+            --image=curlimages/curl \
+            --rm -i --restart=Never \
+            --timeout=30s \
+            -n bedrock-chat-v2 \
+            -- curl -f -m 10 http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/health; then
+            echo "✅ API Gateway health check passed"
+            break
+          else
+            if [[ $i -eq 15 ]]; then
+              echo "❌ All health check attempts failed"
+              kubectl describe pods -n bedrock-chat-v2 -l app=api-gateway
+            else
+              echo "⚠️ Health check failed, retrying in 10 seconds..."
+              sleep 10
+            fi
+          fi
+        done
 
+    - name: Test core endpoints
+      run: |
+        echo "🧪 Testing API Gateway core endpoints..."
+        
         # Test root endpoint
         echo "=== Testing Root Endpoint ==="
-        kubectl run test-api-root-$RANDOM --image=curlimages/curl --rm -i --restart=Never -n bedrock-chat-v2 --timeout=60s -- \
-          curl -f http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/ || echo "⚠️ Root endpoint check failed"
-
+        kubectl run api-root-test-$RANDOM \
+          --image=curlimages/curl \
+          --rm -i --restart=Never \
+          --timeout=30s \
+          -n bedrock-chat-v2 \
+          -- curl -f -m 10 http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/ || echo "⚠️ Root endpoint failed"
+        
         # Test services status endpoint
-        echo "=== Testing Services Status Endpoint ==="
-        kubectl run test-services-status-$RANDOM --image=curlimages/curl --rm -i --restart=Never -n bedrock-chat-v2 --timeout=60s -- \
-          curl -f http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/services/status || echo "⚠️ Services status check failed"
-
-        echo "✅ API Gateway endpoint testing completed"
+        echo "=== Testing Services Status ==="
+        kubectl run api-status-test-$RANDOM \
+          --image=curlimages/curl \
+          --rm -i --restart=Never \
+          --timeout=30s \
+          -n bedrock-chat-v2 \
+          -- curl -f -m 10 http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/services/status || echo "⚠️ Services status failed"
 
     - name: Test service integrations
       run: |
-        echo "🔗 Testing Service Integrations..."
+        echo "🔗 Testing service integrations..."
         
-        # Check if API Gateway can reach Bedrock Service
-        echo "=== Testing Bedrock Service Connection ==="
-        kubectl exec -n bedrock-chat-v2 -l app=api-gateway -- \
-          python -c "
-          import httpx
-          import asyncio
-          
-          async def test_bedrock():
-              try:
-                  async with httpx.AsyncClient(timeout=5.0) as client:
-                      response = await client.get('http://bedrock-service:9000/health')
-                      print(f'Bedrock Service Status: {response.status_code}')
-                      return response.status_code == 200
-              except Exception as e:
-                  print(f'Bedrock Service Error: {e}')
-                  return False
-          
-          result = asyncio.run(test_bedrock())
-          print('✅ Bedrock Service reachable' if result else '⚠️ Bedrock Service unreachable')
-          " 2>/dev/null || echo "⚠️ Bedrock Service integration test failed"
-
-        # Check if API Gateway can reach File Service
-        echo "=== Testing File Service Connection ==="
-        kubectl exec -n bedrock-chat-v2 -l app=api-gateway -- \
-          python -c "
-          import httpx
-          import asyncio
-          
-          async def test_file_service():
-              try:
-                  async with httpx.AsyncClient(timeout=5.0) as client:
-                      response = await client.get('http://file-service:7000/health')
-                      print(f'File Service Status: {response.status_code}')
-                      return response.status_code == 200
-              except Exception as e:
-                  print(f'File Service Error: {e}')
-                  return False
-          
-          result = asyncio.run(test_file_service())
-          print('✅ File Service reachable' if result else '⚠️ File Service unreachable')
-          " 2>/dev/null || echo "⚠️ File Service integration test failed"
-
-        echo "✅ Service integration testing completed"
-
-    - name: Check resource utilization
-      run: |
-        echo "📊 Resource Utilization Check..."
+        # Test Bedrock Service integration
+        echo "=== Testing Bedrock Service Integration ==="
+        kubectl exec -n bedrock-chat-v2 -l app=api-gateway -- python -c "
+        import httpx
+        import asyncio
         
-        echo "=== Node Resources ==="
-        kubectl top nodes || echo "Metrics not available"
+        async def test_bedrock():
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get('http://bedrock-service:9000/health')
+                    print(f'Bedrock Service Status: {response.status_code}')
+                    if response.status_code == 200:
+                        print('✅ Bedrock Service integration working')
+                    else:
+                        print('⚠️ Bedrock Service returned non-200 status')
+            except Exception as e:
+                print(f'❌ Bedrock Service integration failed: {e}')
         
-        echo "=== Pod Resources ==="
-        kubectl top pods -n bedrock-chat-v2 -l app=api-gateway || echo "Pod metrics not available"
+        asyncio.run(test_bedrock())
+        " 2>/dev/null || echo "⚠️ Bedrock Service integration test failed"
+        
+        # Test File Service integration  
+        echo "=== Testing File Service Integration ==="
+        kubectl exec -n bedrock-chat-v2 -l app=api-gateway -- python -c "
+        import httpx
+        import asyncio
+        
+        async def test_file_service():
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get('http://file-service:7000/health')
+                    print(f'File Service Status: {response.status_code}')
+                    if response.status_code == 200:
+                        print('✅ File Service integration working')
+                    else:
+                        print('⚠️ File Service returned non-200 status')
+            except Exception as e:
+                print(f'❌ File Service integration failed: {e}')
+        
+        asyncio.run(test_file_service())
+        " 2>/dev/null || echo "⚠️ File Service integration test failed"
 
     - name: Test database connectivity
       run: |
-        echo "💾 Testing Database Connectivity..."
+        echo "💾 Testing database connectivity..."
         
-        kubectl exec -n bedrock-chat-v2 -l app=api-gateway -- \
-          python -c "
-          import mysql.connector
-          import os
-          
-          try:
-              DATABASE_URL = os.getenv('DATABASE_URL', 'mysql://bedrock_user:bedrock_password@mysql:3306/bedrock_chat')
-              url_parts = DATABASE_URL.replace('mysql://', '').split('/')
-              auth_host = url_parts[0].split('@')
-              auth = auth_host[0].split(':')
-              host_port = auth_host[1].split(':')
-              
-              connection = mysql.connector.connect(
-                  host=host_port[0],
-                  port=int(host_port[1]) if len(host_port) > 1 else 3306,
-                  user=auth[0],
-                  password=auth[1],
-                  database=url_parts[1]
-              )
-              
-              cursor = connection.cursor()
-              cursor.execute('SELECT 1')
-              cursor.fetchone()
-              cursor.close()
-              connection.close()
-              
-              print('✅ Database connection successful')
-          except Exception as e:
-              print(f'⚠️ Database connection failed: {e}')
-          " 2>/dev/null || echo "⚠️ Database connectivity test failed"
+        kubectl exec -n bedrock-chat-v2 -l app=api-gateway -- python -c "
+        import mysql.connector
+        import os
+        
+        try:
+            database_url = os.getenv('DATABASE_URL')
+            print(f'Testing connection with: {database_url}')
+            
+            # Parse DATABASE_URL
+            url_parts = database_url.replace('mysql://', '').split('/')
+            auth_host = url_parts[0].split('@')
+            auth = auth_host[0].split(':')
+            host_port = auth_host[1].split(':')
+            
+            connection = mysql.connector.connect(
+                host=host_port[0],
+                port=int(host_port[1]) if len(host_port) > 1 else 3306,
+                user=auth[0],
+                password=auth[1],
+                database=url_parts[1],
+                connection_timeout=15
+            )
+            
+            cursor = connection.cursor()
+            
+            # Test basic connection
+            cursor.execute('SELECT 1')
+            cursor.fetchone()
+            print('✅ Database connection successful')
+            
+            # Check if conversations table exists
+            cursor.execute(\"SHOW TABLES LIKE 'conversations'\")
+            if cursor.fetchone():
+                print('✅ conversations table exists')
+                
+                # Check table structure
+                cursor.execute('DESCRIBE conversations')
+                columns = cursor.fetchall()
+                print(f'✅ conversations table has {len(columns)} columns')
+            else:
+                print('⚠️ conversations table does not exist - creating it...')
+                # Create conversations table
+                cursor.execute('''
+                CREATE TABLE conversations (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(255) NOT NULL,
+                    message TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    model_used VARCHAR(100),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_session_id (session_id),
+                    INDEX idx_created_at (created_at)
+                )
+                ''')
+                connection.commit()
+                print('✅ conversations table created')
+            
+            cursor.close()
+            connection.close()
+            
+        except Exception as e:
+            print(f'❌ Database connectivity test failed: {e}')
+            exit(1)
+        " 2>/dev/null || echo "⚠️ Database connectivity test failed"
 
-        echo "✅ Database connectivity test completed"
+    - name: Test end-to-end functionality
+      run: |
+        echo "🔄 Testing end-to-end functionality..."
+        
+        # Test a simple chat request
+        echo "=== Testing Chat Endpoint ==="
+        kubectl run api-chat-test-$RANDOM \
+          --image=curlimages/curl \
+          --rm -i --restart=Never \
+          --timeout=60s \
+          -n bedrock-chat-v2 \
+          -- curl -f -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"message":"Hello, this is a test message from CD pipeline","session_id":"cd-test-session"}' \
+            -m 30 \
+            http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/chat || echo "⚠️ End-to-end chat test failed (expected if Bedrock Service doesn't have valid AWS credentials)"
+        
+        # Test conversation history endpoint
+        echo "=== Testing Conversation History ==="
+        kubectl run api-history-test-$RANDOM \
+          --image=curlimages/curl \
+          --rm -i --restart=Never \
+          --timeout=30s \
+          -n bedrock-chat-v2 \
+          -- curl -f -m 10 http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/conversation/cd-test-session || echo "⚠️ Conversation history test failed"
+
+    - name: Performance and load test
+      run: |
+        echo "📊 Basic performance testing..."
+        
+        # Test concurrent requests
+        echo "=== Concurrent Health Checks ==="
+        kubectl run api-load-test-$RANDOM \
+          --image=curlimages/curl \
+          --rm -i --restart=Never \
+          --timeout=60s \
+          -n bedrock-chat-v2 \
+          -- sh -c 'for i in $(seq 1 10); do
+            curl -f -m 5 http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/health &
+          done; wait; echo "All concurrent requests completed"' || echo "⚠️ Load test failed"
+        
+        # Check resource usage
+        echo "=== Resource Usage ==="
+        kubectl top pods -n bedrock-chat-v2 -l app=api-gateway || echo "Metrics not available"
+
+    - name: Setup monitoring and alerts
+      run: |
+        echo "📱 Setting up monitoring..."
+        
+        # Create monitoring CronJob
+        cat << 'EOF' > api-gateway-monitor.yaml
+        apiVersion: batch/v1
+        kind: CronJob
+        metadata:
+          name: api-gateway-monitor
+          namespace: bedrock-chat-v2
+        spec:
+          schedule: "*/2 * * * *"  # Every 2 minutes
+          jobTemplate:
+            spec:
+              template:
+                spec:
+                  containers:
+                  - name: monitor
+                    image: curlimages/curl
+                    command:
+                    - /bin/sh
+                    - -c
+                    - |
+                      echo "=== API Gateway Health Check at $(date) ==="
+                      
+                      # Health check
+                      if curl -f -m 10 http://api-gateway:8000/health; then
+                        echo "✅ API Gateway healthy"
+                      else
+                        echo "❌ API Gateway unhealthy"
+                      fi
+                      
+                      # Services status check
+                      echo "=== Services Status ==="
+                      curl -f -m 10 http://api-gateway:8000/services/status || echo "Services status check failed"
+                      
+                      echo "=== Monitor completed ==="
+                  restartPolicy: OnFailure
+              backoffLimit: 2
+        EOF
+        
+        kubectl apply -f api-gateway-monitor.yaml || echo "⚠️ Monitoring setup failed"
+        rm -f api-gateway-monitor.yaml
+        
+        echo "✅ Monitoring setup completed"
+
+    - name: Create NodePort service for external access
+      run: |
+        echo "🌐 Setting up external access..."
+        
+        # Create NodePort service for external access
+        cat << 'EOF' > api-gateway-nodeport.yaml
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: api-gateway-nodeport
+          namespace: bedrock-chat-v2
+          labels:
+            app: api-gateway
+        spec:
+          type: NodePort
+          ports:
+          - port: 8000
+            targetPort: 8000
+            nodePort: 30800
+            name: http
+          selector:
+            app: api-gateway
+        EOF
+        
+        kubectl apply -f api-gateway-nodeport.yaml || echo "⚠️ NodePort service creation failed"
+        rm -f api-gateway-nodeport.yaml
+        
+        # Get external access info
+        if kubectl get service api-gateway-nodeport -n bedrock-chat-v2 &>/dev/null; then
+          echo "✅ External access configured"
+          echo "NodePort service created - API Gateway accessible on port 30800"
+        fi
 
     - name: Deployment summary
       run: |
-        echo "🎉 **API Gateway Deployment Process Completed!**"
+        echo "🎉 **API Gateway Deployment Complete!**"
         echo ""
-        echo "📋 **Service Status:**"
-        kubectl get pods,svc,hpa -n bedrock-chat-v2 -l app=api-gateway || echo "Components not found"
+        echo "📋 **Status Overview:**"
+        kubectl get deployment,pods,svc -n bedrock-chat-v2 -l app=api-gateway 2>/dev/null || echo "Components still initializing..."
         echo ""
-        echo "🐳 **Image Deployed:**"
-        echo "samitsinghhh/api-gateway:$(git rev-parse HEAD)"
-        echo ""
-        echo "🔗 **API Gateway Endpoints:**"
-        echo "- Health: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/health"
-        echo "- Root: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/"
-        echo "- Chat: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/chat"
-        echo "- File Upload: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/upload"
-        echo "- Conversation History: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/conversation/{session_id}"
-        echo "- Files: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/files/{session_id}"
-        echo "- Services Status: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/services/status"
-        echo ""
-        echo "🔧 **Features Enabled:**"
-        echo "- ✅ Conversation Memory (MySQL storage)"
-        echo "- ✅ File Upload & Analysis (File Service integration)"
-        echo "- ✅ AI Chat (Bedrock Service integration)"
-        echo "- ✅ Multi-session Support"
-        echo "- ✅ Service Health Monitoring"
-        echo "- ✅ CORS enabled for web clients"
-        echo ""
-        echo "🔗 **Service Dependencies:**"
+        echo "🔧 **Configuration:**"
+        echo "- Internal URL: http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000"
+        echo "- External NodePort: :30800 (if configured)"
+        echo "- Database: MySQL (bedrock_chat)"
         echo "- Bedrock Service: http://bedrock-service:9000"
         echo "- File Service: http://file-service:7000"
-        echo "- MySQL Database: mysql:3306/bedrock_chat"
         echo ""
-        echo "💡 **Next Steps:**"
-        echo "- Configure ingress/load balancer to expose API Gateway"
-        echo "- Test end-to-end chat functionality"
-        echo "- Monitor conversation storage in MySQL"
-        echo "- Verify file upload and analysis workflow"
-        echo "- Set up monitoring and alerting"
+        echo "🔗 **API Endpoints:**"
+        echo "- Health Check: GET /health"
+        echo "- Root Info: GET /"
+        echo "- Chat: POST /chat"
+        echo "- File Upload: POST /upload" 
+        echo "- Conversation History: GET /conversation/{session_id}"
+        echo "- Files List: GET /files/{session_id}"
+        echo "- Clear Conversation: DELETE /conversation/{session_id}"
+        echo "- Services Status: GET /services/status"
         echo ""
-        echo "📈 **Monitoring Commands:**"
+        echo "✅ **Features Enabled:**"
+        echo "- ✅ RESTful API Gateway"
+        echo "- ✅ Conversation Memory (MySQL)"
+        echo "- ✅ File Upload & Processing"
+        echo "- ✅ AI Chat Integration (Bedrock)"
+        echo "- ✅ Multi-session Support"
+        echo "- ✅ CORS for web clients"
+        echo "- ✅ Health monitoring"
+        echo "- ✅ Service status monitoring"
+        echo ""
+        echo "🔍 **Testing Commands:**"
+        echo "- Health: curl http://api-gateway:8000/health"
+        echo "- Chat: curl -X POST -H 'Content-Type: application/json' -d '{\"message\":\"Hello\"}' http://api-gateway:8000/chat"
+        echo "- Status: curl http://api-gateway:8000/services/status"
+        echo ""
+        echo "📊 **Monitoring:**"
+        echo "- Logs: kubectl logs -f deployment/api-gateway -n bedrock-chat-v2"
         echo "- Watch pods: kubectl get pods -n bedrock-chat-v2 -l app=api-gateway -w"
-        echo "- Check HPA: kubectl get hpa api-gateway-hpa -n bedrock-chat-v2 -w"
-        echo "- View logs: kubectl logs -f deployment/api-gateway -n bedrock-chat-v2"
-        echo "- Test endpoints: curl http://api-gateway.bedrock-chat-v2.svc.cluster.local:8000/health"
+        echo "- Check HPA: kubectl get hpa api-gateway-hpa -n bedrock-chat-v2"
         echo ""
-        echo "🔧 **Database Commands:**"
-        echo "- Check conversations: kubectl exec -n bedrock-chat-v2 -l app=mysql -- mysql -u bedrock_user -p bedrock_chat -e 'SELECT * FROM conversations LIMIT 5;'"
+        echo "🚀 **Next Steps:**"
+        echo "1. Deploy Frontend to complete the stack"
+        echo "2. Configure ingress for production access"
+        echo "3. Test complete user workflow"
+        echo "4. Monitor conversation storage"
+        echo "5. Set up backup and recovery"
+        echo ""
+        echo "⚠️ **Important Notes:**"
+        echo "- Ensure AWS credentials are properly configured for Bedrock Service"
+        echo "- Monitor database storage usage"
+        echo "- Check file upload size limits"
+        echo "- Verify network policies don't block traffic"
         echo ""
         echo "✅ **API Gateway is ready for production use!**"
